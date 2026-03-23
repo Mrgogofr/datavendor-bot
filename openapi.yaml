@@ -1,0 +1,318 @@
+openapi: "3.1.0"
+
+info:
+  title: "DataVendor Bot API"
+  description: |
+    Machine-to-Machine Crypto Data Marketplace.
+    Pay per call in Bitcoin satoshis. Zero human interaction required.
+    
+    Register free: POST /api/v1/register → 100,000 free sats included.
+    
+    Supported coins: BTC, ETH, SOL, DOGE, XRP, ADA, AVAX, DOT, MATIC, LINK
+  version: "2.0.0"
+  contact:
+    name: "DataVendor Bot"
+    url: "https://web-production-a2ec.up.railway.app"
+  license:
+    name: "MIT"
+    url: "https://opensource.org/licenses/MIT"
+  x-logo:
+    url: "https://web-production-a2ec.up.railway.app/logo.png"
+
+servers:
+  - url: "https://web-production-a2ec.up.railway.app"
+    description: "Production — Live Railway deployment"
+
+tags:
+  - name: "auth"
+    description: "Registration and key management"
+  - name: "prices"
+    description: "Real-time cryptocurrency prices"
+  - name: "signals"
+    description: "Trading signals (BUY/SELL/HOLD)"
+  - name: "analysis"
+    description: "Predictions, sentiment, bundles"
+  - name: "system"
+    description: "Status, pricing, discovery"
+
+paths:
+  /api/v1/register:
+    post:
+      operationId: "registerApiKey"
+      summary: "Register and get free API key"
+      description: "Returns a new API key with 100,000 satoshis balance. No human needed."
+      tags: ["auth"]
+      responses:
+        "201":
+          description: "API key created"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  api_key: { type: string, example: "DV-XXXXXXXXXXXX" }
+                  balance_sats: { type: integer, example: 100000 }
+                  message: { type: string }
+
+  /api/v1/refer:
+    post:
+      operationId: "createReferral"
+      summary: "Create referral key for another bot"
+      description: "Referred bot gets 200k sats. Referrer gets 50k bonus. Pure M2M viral loop."
+      tags: ["auth"]
+      security:
+        - apiKeyQuery: []
+        - bearerAuth: []
+      responses:
+        "201":
+          description: "Referral key created"
+
+  /api/v1/balance:
+    get:
+      operationId: "getBalance"
+      summary: "Check API key balance"
+      tags: ["auth"]
+      security:
+        - apiKeyQuery: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: "Balance info"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  balance_sats: { type: integer }
+                  total_calls: { type: integer }
+                  tier: { type: string }
+
+  /api/v1/prices:
+    get:
+      operationId: "getAllPrices"
+      summary: "All crypto prices — 10 sats"
+      description: "Returns USD prices and 24h change for all 10 supported coins."
+      tags: ["prices"]
+      security:
+        - apiKeyQuery: []
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/apiKeyParam"
+      responses:
+        "200":
+          description: "All prices"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: object }
+                  count: { type: integer }
+                  cost_sats: { type: integer, example: 10 }
+                  remaining_sats: { type: integer }
+
+  /api/v1/price:
+    get:
+      operationId: "getSinglePrice"
+      summary: "Single coin price — 5 sats"
+      tags: ["prices"]
+      security:
+        - apiKeyQuery: []
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/symbolParam"
+        - $ref: "#/components/parameters/apiKeyParam"
+      responses:
+        "200":
+          description: "Price for requested symbol"
+        "404":
+          description: "Unknown symbol"
+
+  /api/v1/signals:
+    get:
+      operationId: "getAllSignals"
+      summary: "All trading signals — 50 sats"
+      description: "BUY/SELL/HOLD signals with confidence score for all coins."
+      tags: ["signals"]
+      security:
+        - apiKeyQuery: []
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/apiKeyParam"
+      responses:
+        "200":
+          description: "All signals"
+
+  /api/v1/signal:
+    get:
+      operationId: "getSingleSignal"
+      summary: "Single trading signal — 25 sats"
+      tags: ["signals"]
+      security:
+        - apiKeyQuery: []
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/symbolParam"
+        - $ref: "#/components/parameters/apiKeyParam"
+      responses:
+        "200":
+          description: "Signal with confidence and reason"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        signal:
+                          type: string
+                          enum: [STRONG_BUY, BUY, HOLD, SELL, STRONG_SELL]
+                        confidence: { type: number, minimum: 0, maximum: 1 }
+                        reason: { type: string }
+                        price_usd: { type: number }
+                        change_24h_pct: { type: number }
+
+  /api/v1/prediction:
+    get:
+      operationId: "getPricePrediction"
+      summary: "Price prediction 1h/4h/24h — 100 sats"
+      tags: ["analysis"]
+      security:
+        - apiKeyQuery: []
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/symbolParam"
+        - $ref: "#/components/parameters/apiKeyParam"
+      responses:
+        "200":
+          description: "Predictions at 1h, 4h, 24h horizons"
+
+  /api/v1/sentiment:
+    get:
+      operationId: "getMarketSentiment"
+      summary: "Market sentiment score — 30 sats"
+      tags: ["analysis"]
+      security:
+        - apiKeyQuery: []
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/symbolParam"
+        - $ref: "#/components/parameters/apiKeyParam"
+      responses:
+        "200":
+          description: "Sentiment: EUPHORIC → PANIC with bullish score"
+
+  /api/v1/bundle:
+    get:
+      operationId: "getFullBundle"
+      summary: "Complete analysis bundle — 150 sats"
+      description: "Price + Signal + Prediction + Sentiment in a single call."
+      tags: ["analysis"]
+      security:
+        - apiKeyQuery: []
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/symbolParam"
+        - $ref: "#/components/parameters/apiKeyParam"
+      responses:
+        "200":
+          description: "Full analysis bundle"
+
+  /api/v1/snapshot:
+    get:
+      operationId: "getMarketSnapshot"
+      summary: "Full market snapshot — 200 sats (IPFS-ready)"
+      description: "Complete snapshot of all data, SHA-256 hashed, ready for IPFS pinning."
+      tags: ["analysis"]
+      security:
+        - apiKeyQuery: []
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/apiKeyParam"
+      responses:
+        "200":
+          description: "Full snapshot with content hash"
+
+  /api/v1/status:
+    get:
+      operationId: "getStatus"
+      summary: "Service health check"
+      tags: ["system"]
+      responses:
+        "200":
+          description: "Operational status"
+
+  /api/v1/pricing:
+    get:
+      operationId: "getPricing"
+      summary: "Full pricing table in satoshis"
+      tags: ["system"]
+      responses:
+        "200":
+          description: "All endpoint prices"
+
+components:
+  parameters:
+    symbolParam:
+      name: symbol
+      in: query
+      required: true
+      description: "Cryptocurrency symbol"
+      schema:
+        type: string
+        enum: [BTC, ETH, SOL, DOGE, XRP, ADA, AVAX, DOT, MATIC, LINK]
+        example: "BTC"
+
+    apiKeyParam:
+      name: key
+      in: query
+      required: false
+      description: "API key (alternative to Bearer header)"
+      schema:
+        type: string
+        example: "DV-XXXXXXXXXXXX"
+
+  securitySchemes:
+    apiKeyQuery:
+      type: apiKey
+      in: query
+      name: key
+      description: "API key as query parameter: ?key=YOUR_KEY"
+
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "API key as Bearer token: Authorization: Bearer YOUR_KEY"
+
+  responses:
+    Unauthorized:
+      description: "Missing or invalid API key"
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string }
+              get_key: { type: string, example: "POST /api/v1/register" }
+
+    InsufficientBalance:
+      description: "Not enough satoshis"
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string, example: "INSUFFICIENT_BALANCE" }
+              required_sats: { type: integer }
+              balance_sats: { type: integer }
+
+x-btc-address: "1QAWwqdrBE7cL3ZBkNgJvmV95nhe3yoHeu"
+x-lightning-topup: "https://web-production-a2ec.up.railway.app/api/v1/topup"
+x-mcp-server: "https://web-production-a2ec.up.railway.app/.well-known/mcp.json"
+x-ai-plugin: "https://web-production-a2ec.up.railway.app/.well-known/ai-plugin.json"
+x-nostr-nip05: "https://web-production-a2ec.up.railway.app/.well-known/nostr.json"
+x-atom-feed: "https://web-production-a2ec.up.railway.app/feed.xml"

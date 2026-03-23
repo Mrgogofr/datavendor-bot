@@ -1,0 +1,15 @@
+# DataVendor Bot — Zero External Dependencies
+# Pure Python 3.12 standard library only
+#
+# stdlib modules used:
+#   http.server   — HTTP server
+#   json          — JSON encoding/decoding
+#   hashlib       — API key generation (SHA-256)
+#   time          — timestamps
+#   urllib        — outbound HTTP (CoinGecko, pings)
+#   threading     — background price/signal workers
+#   os            — environment variables (PORT, RENDER_EXTERNAL_URL)
+#   secrets       — cryptographic random (key generation)
+#
+# No pip install required.
+# python main.py  ← that's it.

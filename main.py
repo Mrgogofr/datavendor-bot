@@ -1,11 +1,17 @@
 # ================================================================
-# DATAVENDOR BOT v3.0 — FICHIER UNIQUE COMPLET
+# DATAVENDOR BOT v3.1 — FICHIER UNIQUE COMPLET
 # ================================================================
 # Machine-to-Machine Crypto Data Marketplace
 # 14 canaux de visibilite automatique integres
 # Zero dependance externe. SQLite persistant. Threaded.
 # Copie → Deploie → Dors definitivement.
 # ================================================================
+#
+# UPGRADES v3.1 vs v3.0 :
+#   [+] Verification TXID automatique via blockchain.info
+#       Zero inscription. Zero API key. Zero intervention humaine.
+#       Le bot paie → soumet TXID → serveur verifie on-chain
+#       → credits ajoutes automatiquement. Vrai M2M pur.
 #
 # UPGRADES v3.0 vs v2.0 :
 #   [1] SQLite persistant  — les cles API survivent aux restarts
@@ -18,7 +24,7 @@
 #   - Ajouter un Volume : Mount Path = /data
 #   - Variable optionnelle : BTC_ADDRESS
 #   - Variable optionnelle : HOST_URL
-#   - Variable optionnelle : ADMIN_TOKEN  (pour confirmer les topups)
+#   - Variable optionnelle : ADMIN_TOKEN  (confirm manuel si besoin)
 #   - Aucune autre config requise
 # ================================================================
 
@@ -191,6 +197,98 @@ def db_confirm_topup(txid):
         return result
 
 # ================================================================
+# VERIFICATION TXID AUTOMATIQUE — NOUVEAUTE v3.1
+# ================================================================
+# Interroge blockchain.info directement — zero inscription,
+# zero API key, zero frais. Pur urllib stdlib.
+#
+# Logique :
+#   1. Recupere la transaction brute via blockchain.info/rawtx
+#   2. Verifie qu'elle est confirmee (block_height present)
+#   3. Verifie qu'un output pointe vers BTC_ADDRESS
+#   4. Verifie que le montant recu >= amount_sats declares
+#   5. Si tout OK → credite automatiquement le solde
+# ================================================================
+
+def verify_txid_onchain(txid, expected_address, min_sats):
+    """
+    Verifie un TXID Bitcoin sur blockchain.info.
+    Retourne (True, sats_recus) ou (False, message_erreur).
+    Zero dependance externe — urllib stdlib uniquement.
+    """
+    try:
+        url = f"https://blockchain.info/rawtx/{txid}"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "DataVendorBot/3.1"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            tx = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False, "TXID_NOT_FOUND"
+        return False, f"HTTP_{e.code}"
+    except Exception as e:
+        return False, f"NETWORK_ERROR: {str(e)[:60]}"
+
+    # Transaction non confirmee = pas de block_height
+    if tx.get("block_height") is None:
+        return False, "UNCONFIRMED"
+
+    # Parcourt les outputs pour trouver un paiement vers notre adresse
+    for out in tx.get("out", []):
+        if out.get("addr") == expected_address:
+            received = out.get("value", 0)  # valeur en satoshis
+            if received >= min_sats:
+                return True, received
+            else:
+                return False, f"AMOUNT_TOO_LOW:{received}_sats_received_{min_sats}_expected"
+
+    return False, "ADDRESS_NOT_FOUND_IN_OUTPUTS"
+
+
+def auto_confirm_topup(txid, api_key, amount_sats):
+    """
+    Tente une verification automatique on-chain puis credite si OK.
+    Appelee immediatement apres POST /api/v1/topup.
+    Tourne dans un thread background pour ne pas bloquer la reponse.
+    Retente toutes les 2 min pendant 2h max (12 tentatives).
+    """
+    max_attempts = 12
+    wait_seconds = 120  # 2 minutes entre chaque tentative
+
+    for attempt in range(1, max_attempts + 1):
+        print(f"[TOPUP] Auto-verify attempt {attempt}/{max_attempts} → {txid[:16]}...")
+        ok, result = verify_txid_onchain(txid, BTC_ADDRESS, amount_sats)
+
+        if ok:
+            confirmed = db_confirm_topup(txid)
+            if confirmed:
+                print(f"[TOPUP] AUTO-CONFIRMED {txid[:16]}... → {result} sats → {api_key[:8]}...")
+            else:
+                print(f"[TOPUP] Already confirmed or not found: {txid[:16]}...")
+            return  # done
+
+        if result == "TXID_NOT_FOUND":
+            print(f"[TOPUP] TXID inexistant: {txid[:16]} — abandon")
+            return  # inutile de retenter
+
+        if result.startswith("AMOUNT_TOO_LOW"):
+            print(f"[TOPUP] Montant insuffisant: {txid[:16]} — {result}")
+            return  # montant incorrect, on n'attend pas
+
+        if result == "ADDRESS_NOT_FOUND_IN_OUTPUTS":
+            print(f"[TOPUP] Adresse BTC introuvable dans la tx: {txid[:16]} — abandon")
+            return  # mauvaise adresse, inutile de retenter
+
+        # UNCONFIRMED ou erreur reseau → on retente
+        print(f"[TOPUP] {result} — retry dans {wait_seconds}s")
+        time.sleep(wait_seconds)
+
+    print(f"[TOPUP] Timeout apres {max_attempts} tentatives: {txid[:16]}")
+
+
+# ================================================================
 # CACHE PRIX EN MEMOIRE (rapide, reconstruit toutes les 60s)
 # ================================================================
 price_cache = {}
@@ -246,7 +344,7 @@ def fetch_prices():
             f"?ids={ids}&vs_currencies=usd"
             f"&include_24hr_change=true&include_last_updated_at=true"
         )
-        req = urllib.request.Request(url, headers={"User-Agent": "DataVendorBot/3.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "DataVendorBot/3.1"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
         now = time.time()
@@ -367,7 +465,7 @@ def auto_ping():
         f"https://api.indexnow.org/indexnow?url={host}/&key=datavendorbot",
     ]:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "DataVendorBot/3.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "DataVendorBot/3.1"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 print(f"[PING] {url[:55]}... → {resp.status}")
         except Exception as e:
@@ -414,7 +512,7 @@ class DataVendorHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type",             "application/json")
         self.send_header("Content-Length",           str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("X-Powered-By",             "DataVendorBot/3.0")
+        self.send_header("X-Powered-By",             "DataVendorBot/3.1")
         self.send_header("Link",
             f'<https://{host}/.well-known/openapi.json>; rel="service-desc", '
             f'<https://{host}/feed.xml>; rel="alternate"; type="application/atom+xml", '
@@ -490,21 +588,20 @@ class DataVendorHandler(BaseHTTPRequestHandler):
             with cache_lock:
                 nc = len(price_cache)
             self.send_json({
-                "service":     "DataVendor Bot API v3.0",
-                "version":     "3.0.0",
+                "service":     "DataVendor Bot API v3.1",
+                "version":     "3.1.0",
                 "description": "M2M Crypto Data Marketplace — 14 Discovery Channels",
                 "status":      "OPERATIONAL",
                 "uptime_seconds": round(time.time() - START_TIME),
                 "supported_coins": list(SUPPORTED_COINS.keys()),
-                "upgrades_v3": [
-                    "SQLite persistant — cles survivent aux restarts",
-                    "ThreadedHTTPServer — 200+ requetes simultanees",
-                    "Topup BTC on-chain — zero API tierce",
+                "upgrades_v31": [
+                    "Verification TXID automatique via blockchain.info",
+                    "Zero inscription. Zero API key. Vrai M2M pur.",
                 ],
                 "endpoints": {
                     "FREE":      {"GET /":"index","GET /api/v1/status":"status","GET /api/v1/pricing":"pricing","GET /api/v1/health":"health","POST /api/v1/register":"cle gratuite 100k sats"},
                     "PAID":      {"GET /api/v1/prices":"10 sats","GET /api/v1/price?symbol=BTC":"5 sats","GET /api/v1/signals":"50 sats","GET /api/v1/signal?symbol=BTC":"25 sats","GET /api/v1/prediction?symbol=BTC":"100 sats","GET /api/v1/sentiment?symbol=BTC":"30 sats","GET /api/v1/bundle?symbol=BTC":"150 sats","GET /api/v1/snapshot":"200 sats"},
-                    "TOPUP":     {"GET /api/v1/topup/address":"adresse BTC + tiers","POST /api/v1/topup":"declarer paiement","POST /api/v1/topup/confirm":"confirmer TXID"},
+                    "TOPUP":     {"GET /api/v1/topup/address":"adresse BTC + tiers","POST /api/v1/topup":"declarer paiement → auto-verifie on-chain","POST /api/v1/topup/confirm":"confirmation manuelle (admin)"},
                     "VIRAL":     {"POST /api/v1/refer":"referral M2M — 200k sats pour le filleul"},
                     "DISCOVERY": {"/.well-known/ai-plugin.json":"ChatGPT","/.well-known/openapi.json":"OpenAPI 3.1","/.well-known/mcp.json":"Claude MCP","/.well-known/agent.json":"AutoGPT","/.well-known/nostr.json":"Nostr NIP-05","/schema.json":"Schema.org","/feed.xml":"Atom","/robots.txt":"Crawlers","/sitemap.xml":"Sitemap","/datavendorbot.txt":"IndexNow"},
                 },
@@ -516,7 +613,7 @@ class DataVendorHandler(BaseHTTPRequestHandler):
         if base == "/api/v1/health":
             with cache_lock:
                 nc = len(price_cache)
-            self.send_json({"status":"ok","db":"sqlite","prices":nc,"uptime":round(time.time()-START_TIME)})
+            self.send_json({"status":"ok","db":"sqlite","prices":nc,"uptime":round(time.time()-START_TIME),"version":"3.1.0"})
             return
 
         if base == "/api/v1/status":
@@ -527,7 +624,7 @@ class DataVendorHandler(BaseHTTPRequestHandler):
                 last = max((d["fetched_at"] for d in price_cache.values()), default=0)
             self.send_json({
                 "status":             "OPERATIONAL",
-                "version":            "3.0.0",
+                "version":            "3.1.0",
                 "coins_tracked":      nc,
                 "signals_active":     ns,
                 "uptime_seconds":     round(time.time() - START_TIME),
@@ -536,6 +633,7 @@ class DataVendorHandler(BaseHTTPRequestHandler):
                 "discovery_channels": 14,
                 "persistence":        "SQLite",
                 "server":             "ThreadedHTTP",
+                "topup_verification": "auto:blockchain.info",
                 "last_price_update":  last,
             })
             return
@@ -555,14 +653,15 @@ class DataVendorHandler(BaseHTTPRequestHandler):
                 "btc_address": BTC_ADDRESS,
                 "network":     "Bitcoin mainnet (on-chain)",
                 "tiers":       TOPUP_TIERS,
+                "auto_verify": True,
                 "instructions": [
                     "1. Envoie des BTC a cette adresse",
                     "2. Note ton TXID (transaction ID) visible dans ton wallet",
                     "3. POST /api/v1/topup {api_key, txid, amount_sats}",
-                    "4. Attends 1 confirmation (~10 min)",
-                    "5. POST /api/v1/topup/confirm {txid} pour crediter",
+                    "4. Le serveur verifie automatiquement on-chain (~10 min)",
+                    "5. Credits ajoutes automatiquement — aucune action requise",
                 ],
-                "note": "Credits ajoutes apres verification manuelle ou automatique du TXID.",
+                "note": "Verification automatique via blockchain.info. Zero intervention humaine.",
             })
             return
 
@@ -665,7 +764,7 @@ class DataVendorHandler(BaseHTTPRequestHandler):
                 pc_snap  = dict(price_cache)
                 sig_snap = dict(signals)
             snapshot = {
-                "vendor":        "DataVendor Bot v3.0",
+                "vendor":        "DataVendor Bot v3.1",
                 "snapshot_time": time.time(),
                 "snapshot_iso":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "prices":        pc_snap,
@@ -696,7 +795,7 @@ class DataVendorHandler(BaseHTTPRequestHandler):
         if base in ("/.well-known/openapi.json","/.well-known/openapi.yaml","/openapi.json"):
             self.send_json({
                 "openapi":"3.1.0",
-                "info":{"title":"DataVendor Bot API","description":"M2M Crypto Data Marketplace. Pay per call in Bitcoin satoshis.","version":"3.0.0","contact":{"name":"API Bot","url":f"https://{host}/"}},
+                "info":{"title":"DataVendor Bot API","description":"M2M Crypto Data Marketplace. Pay per call in Bitcoin satoshis.","version":"3.1.0","contact":{"name":"API Bot","url":f"https://{host}/"}},
                 "servers":[{"url":f"https://{host}","description":"Production"}],
                 "paths":{
                     "/api/v1/register":       {"post":{"operationId":"register",       "summary":"Get free API key (100k sats)"}},
@@ -708,8 +807,8 @@ class DataVendorHandler(BaseHTTPRequestHandler):
                     "/api/v1/sentiment":      {"get": {"operationId":"getSentiment",   "summary":"Market sentiment (30 sats)"}},
                     "/api/v1/bundle":         {"get": {"operationId":"getBundle",      "summary":"Full bundle (150 sats)"}},
                     "/api/v1/snapshot":       {"get": {"operationId":"getSnapshot",    "summary":"IPFS snapshot (200 sats)"}},
-                    "/api/v1/topup":          {"post":{"operationId":"topup",          "summary":"Declare BTC on-chain topup"}},
-                    "/api/v1/topup/confirm":  {"post":{"operationId":"confirmTopup",   "summary":"Confirm TXID and credit balance"}},
+                    "/api/v1/topup":          {"post":{"operationId":"topup",          "summary":"Declare BTC topup → auto-verified on-chain"}},
+                    "/api/v1/topup/confirm":  {"post":{"operationId":"confirmTopup",   "summary":"Manual confirm (admin fallback)"}},
                 },
                 "components":{"securitySchemes":{"apiKey":{"type":"apiKey","in":"query","name":"key"},"bearer":{"type":"http","scheme":"bearer"}}},
             })
@@ -717,7 +816,7 @@ class DataVendorHandler(BaseHTTPRequestHandler):
 
         if base == "/.well-known/mcp.json":
             self.send_json({
-                "name":"crypto-data-vendor","version":"3.0.0",
+                "name":"crypto-data-vendor","version":"3.1.0",
                 "description":"Real-time crypto data. Prices, signals, predictions. Pay in sats.",
                 "server":{"type":"http","url":f"https://{host}"},
                 "tools":[
@@ -732,9 +831,9 @@ class DataVendorHandler(BaseHTTPRequestHandler):
         if base == "/.well-known/agent.json":
             self.send_json({
                 "name":"DataVendor Crypto API","description":"Autonomous data vendor. Machines pay machines in satoshis.",
-                "url":f"https://{host}","version":"3.0.0","protocol":"http-rest-json",
+                "url":f"https://{host}","version":"3.1.0","protocol":"http-rest-json",
                 "capabilities":["crypto-prices","trading-signals","predictions","sentiment"],
-                "payment":{"method":"bitcoin-onchain","currency":"satoshis","address":BTC_ADDRESS,"register":f"https://{host}/api/v1/register","topup":f"https://{host}/api/v1/topup/address"},
+                "payment":{"method":"bitcoin-onchain","currency":"satoshis","address":BTC_ADDRESS,"register":f"https://{host}/api/v1/register","topup":f"https://{host}/api/v1/topup/address","auto_verify":True},
                 "documentation":f"https://{host}/","openapi":f"https://{host}/.well-known/openapi.json",
             })
             return
@@ -777,7 +876,7 @@ class DataVendorHandler(BaseHTTPRequestHandler):
                 f'  <link href="https://{host}/" rel="alternate"/>\n'
                 f'  <id>tag:{host},2025:datavendor</id>\n'
                 f'  <updated>{now_str}</updated>\n'
-                f'  <generator>DataVendor Bot 3.0</generator>'
+                f'  <generator>DataVendor Bot 3.1</generator>'
                 f'{entries}\n</feed>'
             ).encode())
             return
@@ -864,10 +963,12 @@ class DataVendorHandler(BaseHTTPRequestHandler):
             },201)
             return
 
+        # ---- TOPUP v3.1 : enregistre + lance verification automatique ----
         if base == "/api/v1/topup":
             api_key     = body.get("api_key") or self.get_api_key()
             txid        = str(body.get("txid","")).strip()
             amount_sats = int(body.get("amount_sats", 0))
+
             if not api_key or not db_get_key(api_key):
                 self.send_json({"error":"INVALID_KEY"},401); return
             if not txid or len(txid) < 10:
@@ -879,17 +980,32 @@ class DataVendorHandler(BaseHTTPRequestHandler):
                 },400); return
             if amount_sats < 10_000:
                 self.send_json({"error":"AMOUNT_TOO_LOW","minimum":10_000,"tiers":TOPUP_TIERS},400); return
+
             ok = db_register_topup(txid, api_key, amount_sats)
             if not ok:
                 self.send_json({"error":"TXID_ALREADY_REGISTERED"},409); return
+
+            # Lance la verification on-chain en arriere-plan — ne bloque pas la reponse
+            threading.Thread(
+                target=auto_confirm_topup,
+                args=(txid, api_key, amount_sats),
+                daemon=True
+            ).start()
+
             self.send_json({
-                "success":True,"txid":txid,"api_key":api_key[:8]+"...",
-                "amount_sats":amount_sats,"status":"PENDING",
-                "next_step":"POST /api/v1/topup/confirm {txid} apres 1 confirmation on-chain (~10 min)",
-                "btc_address":BTC_ADDRESS,
+                "success":      True,
+                "txid":         txid,
+                "api_key":      api_key[:8]+"...",
+                "amount_sats":  amount_sats,
+                "status":       "PENDING_AUTO_VERIFICATION",
+                "auto_verify":  True,
+                "message":      "Verification on-chain automatique lancee. Credits ajoutes sous ~10 min apres confirmation Bitcoin.",
+                "btc_address":  BTC_ADDRESS,
+                "fallback":     "Si non credite apres 2h, utilise POST /api/v1/topup/confirm",
             },201)
             return
 
+        # ---- TOPUP CONFIRM : confirmation manuelle (fallback admin) ----
         if base == "/api/v1/topup/confirm":
             txid        = str(body.get("txid","")).strip()
             admin_token = str(body.get("admin_token","")).strip()
@@ -927,14 +1043,15 @@ def main():
     init_db()
 
     print("=" * 60)
-    print("DATAVENDOR BOT v3.0")
-    print("  SQLite persistant + ThreadedHTTP + BTC on-chain")
+    print("DATAVENDOR BOT v3.1")
+    print("  SQLite + ThreadedHTTP + BTC auto-verify on-chain")
     print("=" * 60)
     print(f"Coins   : {', '.join(SUPPORTED_COINS.keys())}")
     print(f"Port    : {PORT}")
     print(f"DB      : {DB_PATH}")
     print(f"BTC     : {BTC_ADDRESS}")
     print(f"Demo key: DEMO-KEY-123")
+    print(f"Topup   : auto-verification via blockchain.info")
     print("=" * 60)
 
     threading.Thread(target=price_updater,   daemon=True).start()

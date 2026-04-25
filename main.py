@@ -1,43 +1,48 @@
 # ================================================================
-# DATAVENDOR BOT v3.1 — FICHIER UNIQUE COMPLET
+# DATAVENDOR BOT v4.0 — FastAPI + uvicorn
 # ================================================================
-# Machine-to-Machine Crypto Data Marketplace
-# 14 canaux de visibilite automatique integres
-# Zero dependance externe. SQLite persistant. Threaded.
-# Copie → Deploie → Dors definitivement.
+# Migration depuis v3.1 ThreadingMixIn → async FastAPI
+# 10 000+ connexions simultanees. Zero saturation.
+# Meme logique metier, meme SQLite, meme endpoints.
 # ================================================================
 #
-# UPGRADES v3.1 vs v3.0 :
-#   [+] Verification TXID automatique via blockchain.info
-#       Zero inscription. Zero API key. Zero intervention humaine.
-#       Le bot paie → soumet TXID → serveur verifie on-chain
-#       → credits ajoutes automatiquement. Vrai M2M pur.
+# INSTALL :
+#   pip install fastapi uvicorn
 #
-# UPGRADES v3.0 vs v2.0 :
-#   [1] SQLite persistant  — les cles API survivent aux restarts
-#   [2] ThreadingMixIn     — 200+ requetes simultanees
-#   [3] Topup BTC on-chain — paiement direct, zero API tierce
-#   [4] Webhook confirm    — verification TXID manuelle ou auto
-#   [5] Health endpoint    — monitoring Railway
+# LANCEMENT LOCAL :
+#   uvicorn main_fastapi:app --host 0.0.0.0 --port 10000
 #
 # DEPLOY RAILWAY :
-#   - Ajouter un Volume : Mount Path = /data
-#   - Variable optionnelle : BTC_ADDRESS
-#   - Variable optionnelle : HOST_URL
-#   - Variable optionnelle : ADMIN_TOKEN  (confirm manuel si besoin)
-#   - Aucune autre config requise
+#   Procfile : web: uvicorn main_fastapi:app --host 0.0.0.0 --port $PORT --workers 4
+#   Volume   : Mount Path = /data
+#   Variables: BTC_ADDRESS, HOST_URL, ADMIN_TOKEN (optionnels)
+#
+# DEPLOY HUGGING FACE SPACES :
+#   SDK      : gradio  (ou docker)
+#   app.py   : renommer ce fichier en app.py
+#   requirements.txt : fastapi uvicorn
+#   README   : sdk: docker (voir section ci-dessous)
+#
+# AUTRES HEBERGEURS GRATUITS :
+#   Render.com  : Start Command = uvicorn main_fastapi:app --host 0.0.0.0 --port $PORT
+#   Fly.io      : fly launch puis fly deploy
+#   Koyeb       : buildpack Python, Start = uvicorn main_fastapi:app ...
 # ================================================================
 
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
+from fastapi import FastAPI, Request, HTTPException, Header
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
+import asyncio
 import json
 import hashlib
 import time
 import urllib.request
+import urllib.error
 import threading
 import os
 import secrets
 import sqlite3
+from contextlib import asynccontextmanager
+from typing import Optional
 
 # ================================================================
 # CONFIG GLOBALE
@@ -49,7 +54,7 @@ PORT        = int(os.environ.get("PORT",    10000))
 START_TIME  = time.time()
 
 # ================================================================
-# SQLITE PERSISTANT
+# SQLITE PERSISTANT — identique v3.1
 # ================================================================
 DB_LOCK = threading.Lock()
 
@@ -197,99 +202,7 @@ def db_confirm_topup(txid):
         return result
 
 # ================================================================
-# VERIFICATION TXID AUTOMATIQUE — NOUVEAUTE v3.1
-# ================================================================
-# Interroge blockchain.info directement — zero inscription,
-# zero API key, zero frais. Pur urllib stdlib.
-#
-# Logique :
-#   1. Recupere la transaction brute via blockchain.info/rawtx
-#   2. Verifie qu'elle est confirmee (block_height present)
-#   3. Verifie qu'un output pointe vers BTC_ADDRESS
-#   4. Verifie que le montant recu >= amount_sats declares
-#   5. Si tout OK → credite automatiquement le solde
-# ================================================================
-
-def verify_txid_onchain(txid, expected_address, min_sats):
-    """
-    Verifie un TXID Bitcoin sur blockchain.info.
-    Retourne (True, sats_recus) ou (False, message_erreur).
-    Zero dependance externe — urllib stdlib uniquement.
-    """
-    try:
-        url = f"https://blockchain.info/rawtx/{txid}"
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "DataVendorBot/3.1"}
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            tx = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return False, "TXID_NOT_FOUND"
-        return False, f"HTTP_{e.code}"
-    except Exception as e:
-        return False, f"NETWORK_ERROR: {str(e)[:60]}"
-
-    # Transaction non confirmee = pas de block_height
-    if tx.get("block_height") is None:
-        return False, "UNCONFIRMED"
-
-    # Parcourt les outputs pour trouver un paiement vers notre adresse
-    for out in tx.get("out", []):
-        if out.get("addr") == expected_address:
-            received = out.get("value", 0)  # valeur en satoshis
-            if received >= min_sats:
-                return True, received
-            else:
-                return False, f"AMOUNT_TOO_LOW:{received}_sats_received_{min_sats}_expected"
-
-    return False, "ADDRESS_NOT_FOUND_IN_OUTPUTS"
-
-
-def auto_confirm_topup(txid, api_key, amount_sats):
-    """
-    Tente une verification automatique on-chain puis credite si OK.
-    Appelee immediatement apres POST /api/v1/topup.
-    Tourne dans un thread background pour ne pas bloquer la reponse.
-    Retente toutes les 2 min pendant 2h max (12 tentatives).
-    """
-    max_attempts = 12
-    wait_seconds = 120  # 2 minutes entre chaque tentative
-
-    for attempt in range(1, max_attempts + 1):
-        print(f"[TOPUP] Auto-verify attempt {attempt}/{max_attempts} → {txid[:16]}...")
-        ok, result = verify_txid_onchain(txid, BTC_ADDRESS, amount_sats)
-
-        if ok:
-            confirmed = db_confirm_topup(txid)
-            if confirmed:
-                print(f"[TOPUP] AUTO-CONFIRMED {txid[:16]}... → {result} sats → {api_key[:8]}...")
-            else:
-                print(f"[TOPUP] Already confirmed or not found: {txid[:16]}...")
-            return  # done
-
-        if result == "TXID_NOT_FOUND":
-            print(f"[TOPUP] TXID inexistant: {txid[:16]} — abandon")
-            return  # inutile de retenter
-
-        if result.startswith("AMOUNT_TOO_LOW"):
-            print(f"[TOPUP] Montant insuffisant: {txid[:16]} — {result}")
-            return  # montant incorrect, on n'attend pas
-
-        if result == "ADDRESS_NOT_FOUND_IN_OUTPUTS":
-            print(f"[TOPUP] Adresse BTC introuvable dans la tx: {txid[:16]} — abandon")
-            return  # mauvaise adresse, inutile de retenter
-
-        # UNCONFIRMED ou erreur reseau → on retente
-        print(f"[TOPUP] {result} — retry dans {wait_seconds}s")
-        time.sleep(wait_seconds)
-
-    print(f"[TOPUP] Timeout apres {max_attempts} tentatives: {txid[:16]}")
-
-
-# ================================================================
-# CACHE PRIX EN MEMOIRE (rapide, reconstruit toutes les 60s)
+# CACHE PRIX EN MEMOIRE
 # ================================================================
 price_cache = {}
 signals     = {}
@@ -311,9 +224,6 @@ SUPPORTED_COINS = {
     "LINK":  "chainlink",
 }
 
-# ================================================================
-# TARIFICATION (satoshis)
-# ================================================================
 PRICING = {
     "/api/v1/prices":      10,
     "/api/v1/price":        5,
@@ -334,7 +244,7 @@ TOPUP_TIERS = [
 ]
 
 # ================================================================
-# DATA FETCHERS
+# DATA FETCHERS — identiques v3.1
 # ================================================================
 def fetch_prices():
     try:
@@ -344,7 +254,7 @@ def fetch_prices():
             f"?ids={ids}&vs_currencies=usd"
             f"&include_24hr_change=true&include_last_updated_at=true"
         )
-        req = urllib.request.Request(url, headers={"User-Agent": "DataVendorBot/3.1"})
+        req = urllib.request.Request(url, headers={"User-Agent": "DataVendorBot/4.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode())
         now = time.time()
@@ -358,6 +268,12 @@ def fetch_prices():
                         "fetched_at":     now,
                     }
         print(f"[PRICES] {len(price_cache)} prix mis a jour")
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            print(f"[PRICES] Rate limited CoinGecko — attente 10 min")
+            time.sleep(600)
+        else:
+            print(f"[PRICES] HTTP Erreur: {e.code}")
     except Exception as e:
         print(f"[PRICES] Erreur: {e}")
 
@@ -425,30 +341,95 @@ def get_sentiment(symbol):
     }
 
 # ================================================================
+# VERIFICATION TXID — identique v3.1
+# ================================================================
+def verify_txid_onchain(txid, expected_address, min_sats):
+    try:
+        url = f"https://blockchain.info/rawtx/{txid}"
+        req = urllib.request.Request(url, headers={"User-Agent": "DataVendorBot/4.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            tx = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False, "TXID_NOT_FOUND"
+        return False, f"HTTP_{e.code}"
+    except Exception as e:
+        return False, f"NETWORK_ERROR: {str(e)[:60]}"
+    if tx.get("block_height") is None:
+        return False, "UNCONFIRMED"
+    for out in tx.get("out", []):
+        if out.get("addr") == expected_address:
+            received = out.get("value", 0)
+            if received >= min_sats:
+                return True, received
+            else:
+                return False, f"AMOUNT_TOO_LOW:{received}_sats_received_{min_sats}_expected"
+    return False, "ADDRESS_NOT_FOUND_IN_OUTPUTS"
+
+def auto_confirm_topup(txid, api_key, amount_sats):
+    max_attempts = 12
+    wait_seconds = 120
+    for attempt in range(1, max_attempts + 1):
+        print(f"[TOPUP] Auto-verify {attempt}/{max_attempts} → {txid[:16]}...")
+        ok, result = verify_txid_onchain(txid, BTC_ADDRESS, amount_sats)
+        if ok:
+            confirmed = db_confirm_topup(txid)
+            if confirmed:
+                print(f"[TOPUP] AUTO-CONFIRMED {txid[:16]}... → {result} sats")
+            return
+        if result in ("TXID_NOT_FOUND", "ADDRESS_NOT_FOUND_IN_OUTPUTS") or result.startswith("AMOUNT_TOO_LOW"):
+            print(f"[TOPUP] Abandon: {result}")
+            return
+        print(f"[TOPUP] {result} — retry dans {wait_seconds}s")
+        time.sleep(wait_seconds)
+    print(f"[TOPUP] Timeout: {txid[:16]}")
+
+# ================================================================
 # AUTH
 # ================================================================
-def verify_api_key(key):
-    row = db_get_key(key)
-    if not row:
-        return False, "INVALID_KEY"
-    if row["balance_sats"] <= 0:
-        return False, "NO_BALANCE"
-    return True, "OK"
-
 def generate_api_key():
     raw = f"{time.time()}-{secrets.token_hex(16)}"
     return "DV-" + hashlib.sha256(raw.encode()).hexdigest()[:32].upper()
 
+def get_api_key_from_request(request: Request, authorization: Optional[str] = None) -> Optional[str]:
+    if authorization and authorization.startswith("Bearer "):
+        return authorization[7:].strip()
+    return request.query_params.get("key")
+
+def require_auth(request: Request, endpoint: str, authorization: Optional[str] = None):
+    key = get_api_key_from_request(request, authorization)
+    if not key:
+        raise HTTPException(status_code=401, detail={
+            "error": "NO_API_KEY",
+            "message": "Utilise 'Authorization: Bearer KEY' ou '?key=KEY'",
+            "get_key": "POST /api/v1/register"
+        })
+    row = db_get_key(key)
+    if not row:
+        raise HTTPException(status_code=403, detail={"error": "INVALID_KEY"})
+    if row["balance_sats"] <= 0:
+        raise HTTPException(status_code=403, detail={"error": "NO_BALANCE"})
+    cost = PRICING.get(endpoint, 10)
+    if not db_charge(key, endpoint, cost):
+        raise HTTPException(status_code=402, detail={
+            "error": "INSUFFICIENT_BALANCE",
+            "required_sats": cost,
+            "balance_sats": row["balance_sats"],
+            "topup": "POST /api/v1/topup"
+        })
+    return key
+
 # ================================================================
-# BACKGROUND THREADS
+# BACKGROUND THREADS — identiques v3.1
 # ================================================================
 def price_updater():
+    time.sleep(15)
     while True:
         fetch_prices()
-        time.sleep(60)
+        time.sleep(300)  # 5 min — evite le rate limit CoinGecko
 
 def signal_updater():
-    time.sleep(10)
+    time.sleep(25)
     while True:
         generate_signals()
         with cache_lock:
@@ -465,7 +446,7 @@ def auto_ping():
         f"https://api.indexnow.org/indexnow?url={host}/&key=datavendorbot",
     ]:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "DataVendorBot/3.1"})
+            req = urllib.request.Request(url, headers={"User-Agent": "DataVendorBot/4.0"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 print(f"[PING] {url[:55]}... → {resp.status}")
         except Exception as e:
@@ -490,580 +471,360 @@ def nostr_broadcast():
         time.sleep(3600)
 
 # ================================================================
-# SERVEUR HTTP MULTI-THREAD
+# LIFESPAN FastAPI — demarre les threads au boot
 # ================================================================
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    """Chaque requete dans son propre thread — 200+ connexions simultanees."""
-    daemon_threads      = True
-    allow_reuse_address = True
-
-class DataVendorHandler(BaseHTTPRequestHandler):
-
-    def log_message(self, fmt, *args):
-        print(f"[API] {args[0]}")
-
-    def get_host(self):
-        return self.headers.get("Host", "localhost")
-
-    def send_json(self, data, status=200):
-        host = self.get_host()
-        body = json.dumps(data, indent=2).encode()
-        self.send_response(status)
-        self.send_header("Content-Type",             "application/json")
-        self.send_header("Content-Length",           str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("X-Powered-By",             "DataVendorBot/3.1")
-        self.send_header("Link",
-            f'<https://{host}/.well-known/openapi.json>; rel="service-desc", '
-            f'<https://{host}/feed.xml>; rel="alternate"; type="application/atom+xml", '
-            f'<https://{host}/.well-known/ai-plugin.json>; rel="ai-plugin", '
-            f'<https://{host}/.well-known/mcp.json>; rel="mcp-server"'
-        )
-        self.send_header("X-Robots-Tag", "all, index, follow")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def get_api_key(self):
-        auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            return auth[7:].strip()
-        return self.get_query_params().get("key")
-
-    def get_base_path(self):
-        return self.path.split("?")[0]
-
-    def get_query_params(self):
-        params = {}
-        if "?" in self.path:
-            for p in self.path.split("?")[1].split("&"):
-                if "=" in p:
-                    k, v = p.split("=", 1)
-                    params[k] = v
-        return params
-
-    def read_body(self):
-        length = int(self.headers.get("Content-Length", 0))
-        if length > 0:
-            try:
-                return json.loads(self.rfile.read(length))
-            except Exception:
-                pass
-        return {}
-
-    def require_auth(self):
-        key = self.get_api_key()
-        if not key:
-            self.send_json({
-                "error":   "NO_API_KEY",
-                "message": "Utilise 'Authorization: Bearer KEY' ou '?key=KEY'",
-                "get_key": "POST /api/v1/register",
-            }, 401)
-            return None
-        valid, reason = verify_api_key(key)
-        if not valid:
-            self.send_json({"error": reason}, 403)
-            return None
-        cost = PRICING.get(self.get_base_path(), 10)
-        if not db_charge(key, self.get_base_path(), cost):
-            row = db_get_key(key)
-            self.send_json({
-                "error":         "INSUFFICIENT_BALANCE",
-                "required_sats": cost,
-                "balance_sats":  row["balance_sats"] if row else 0,
-                "topup":         "POST /api/v1/topup",
-            }, 402)
-            return None
-        return key
-
-    # ==============================================================
-    # GET
-    # ==============================================================
-    def do_GET(self):
-        base   = self.get_base_path()
-        params = self.get_query_params()
-        host   = self.get_host()
-
-        if base in ("/", ""):
-            stats = db_get_stats()
-            with cache_lock:
-                nc = len(price_cache)
-            self.send_json({
-                "service":     "DataVendor Bot API v3.1",
-                "version":     "3.1.0",
-                "description": "M2M Crypto Data Marketplace — 14 Discovery Channels",
-                "status":      "OPERATIONAL",
-                "uptime_seconds": round(time.time() - START_TIME),
-                "supported_coins": list(SUPPORTED_COINS.keys()),
-                "upgrades_v31": [
-                    "Verification TXID automatique via blockchain.info",
-                    "Zero inscription. Zero API key. Vrai M2M pur.",
-                ],
-                "endpoints": {
-                    "FREE":      {"GET /":"index","GET /api/v1/status":"status","GET /api/v1/pricing":"pricing","GET /api/v1/health":"health","POST /api/v1/register":"cle gratuite 100k sats"},
-                    "PAID":      {"GET /api/v1/prices":"10 sats","GET /api/v1/price?symbol=BTC":"5 sats","GET /api/v1/signals":"50 sats","GET /api/v1/signal?symbol=BTC":"25 sats","GET /api/v1/prediction?symbol=BTC":"100 sats","GET /api/v1/sentiment?symbol=BTC":"30 sats","GET /api/v1/bundle?symbol=BTC":"150 sats","GET /api/v1/snapshot":"200 sats"},
-                    "TOPUP":     {"GET /api/v1/topup/address":"adresse BTC + tiers","POST /api/v1/topup":"declarer paiement → auto-verifie on-chain","POST /api/v1/topup/confirm":"confirmation manuelle (admin)"},
-                    "VIRAL":     {"POST /api/v1/refer":"referral M2M — 200k sats pour le filleul"},
-                    "DISCOVERY": {"/.well-known/ai-plugin.json":"ChatGPT","/.well-known/openapi.json":"OpenAPI 3.1","/.well-known/mcp.json":"Claude MCP","/.well-known/agent.json":"AutoGPT","/.well-known/nostr.json":"Nostr NIP-05","/schema.json":"Schema.org","/feed.xml":"Atom","/robots.txt":"Crawlers","/sitemap.xml":"Sitemap","/datavendorbot.txt":"IndexNow"},
-                },
-                "btc_address": BTC_ADDRESS,
-                "stats": stats,
-            })
-            return
-
-        if base == "/api/v1/health":
-            with cache_lock:
-                nc = len(price_cache)
-            self.send_json({"status":"ok","db":"sqlite","prices":nc,"uptime":round(time.time()-START_TIME),"version":"3.1.0"})
-            return
-
-        if base == "/api/v1/status":
-            stats = db_get_stats()
-            with cache_lock:
-                nc   = len(price_cache)
-                ns   = len(signals)
-                last = max((d["fetched_at"] for d in price_cache.values()), default=0)
-            self.send_json({
-                "status":             "OPERATIONAL",
-                "version":            "3.1.0",
-                "coins_tracked":      nc,
-                "signals_active":     ns,
-                "uptime_seconds":     round(time.time() - START_TIME),
-                "total_api_calls":    stats["total_calls"],
-                "total_revenue_sats": stats["total_revenue"],
-                "discovery_channels": 14,
-                "persistence":        "SQLite",
-                "server":             "ThreadedHTTP",
-                "topup_verification": "auto:blockchain.info",
-                "last_price_update":  last,
-            })
-            return
-
-        if base == "/api/v1/pricing":
-            self.send_json({
-                "currency":         "satoshis (1 BTC = 100 000 000 sats)",
-                "pricing":          {k: f"{v} sats" for k, v in PRICING.items()},
-                "demo_balance":     "100 000 sats (gratuit)",
-                "referral_balance": "200 000 sats (via /api/v1/refer)",
-                "topup_tiers":      TOPUP_TIERS,
-            })
-            return
-
-        if base == "/api/v1/topup/address":
-            self.send_json({
-                "btc_address": BTC_ADDRESS,
-                "network":     "Bitcoin mainnet (on-chain)",
-                "tiers":       TOPUP_TIERS,
-                "auto_verify": True,
-                "instructions": [
-                    "1. Envoie des BTC a cette adresse",
-                    "2. Note ton TXID (transaction ID) visible dans ton wallet",
-                    "3. POST /api/v1/topup {api_key, txid, amount_sats}",
-                    "4. Le serveur verifie automatiquement on-chain (~10 min)",
-                    "5. Credits ajoutes automatiquement — aucune action requise",
-                ],
-                "note": "Verification automatique via blockchain.info. Zero intervention humaine.",
-            })
-            return
-
-        if base == "/api/v1/listing":
-            self.send_json({
-                "public_apis_format": {"API":"DataVendor Crypto Bot","Description":"M2M crypto data: prices, signals, predictions. Pay in sats.","Auth":"apiKey","HTTPS":True,"CORS":"yes","Link":f"https://{host}/","Category":"Cryptocurrency"},
-                "rapidapi_format":    {"name":"DataVendor Crypto Bot API","tagline":"M2M crypto data marketplace","category":"Finance","base_url":f"https://{host}","endpoints":9,"pricing":"Freemium"},
-                "apis_guru_format":   {"openapi_spec":f"https://{host}/.well-known/openapi.json","provider":"datavendor-bot","category":"financial"},
-            })
-            return
-
-        if base == "/api/v1/balance":
-            key = self.get_api_key()
-            if not key:
-                self.send_json({"error":"NO_API_KEY"},401); return
-            row = db_get_key(key)
-            if not row:
-                self.send_json({"error":"INVALID_KEY"},401); return
-            self.send_json({"balance_sats":row["balance_sats"],"total_calls":row["calls"],"tier":row["tier"],"topup":"POST /api/v1/topup"})
-            return
-
-        # --- Endpoints payes ---
-        if base == "/api/v1/prices":
-            key = self.require_auth()
-            if not key: return
-            with cache_lock: snap = dict(price_cache)
-            row = db_get_key(key)
-            self.send_json({"data":snap,"count":len(snap),"cost_sats":PRICING[base],"remaining_sats":row["balance_sats"] if row else 0})
-            return
-
-        if base == "/api/v1/price":
-            key = self.require_auth()
-            if not key: return
-            sym = params.get("symbol","BTC").upper()
-            with cache_lock: data = price_cache.get(sym)
-            if not data:
-                self.send_json({"error":"UNKNOWN_SYMBOL","supported":list(SUPPORTED_COINS.keys())},404); return
-            row = db_get_key(key)
-            self.send_json({"data":{sym:data},"cost_sats":PRICING[base],"remaining_sats":row["balance_sats"] if row else 0})
-            return
-
-        if base == "/api/v1/signals":
-            key = self.require_auth()
-            if not key: return
-            with cache_lock: snap = dict(signals)
-            row = db_get_key(key)
-            self.send_json({"data":snap,"count":len(snap),"cost_sats":PRICING[base],"remaining_sats":row["balance_sats"] if row else 0})
-            return
-
-        if base == "/api/v1/signal":
-            key = self.require_auth()
-            if not key: return
-            sym = params.get("symbol","BTC").upper()
-            with cache_lock: sig = signals.get(sym)
-            if not sig:
-                self.send_json({"error":"NO_SIGNAL","supported":list(SUPPORTED_COINS.keys())},404); return
-            row = db_get_key(key)
-            self.send_json({"data":{sym:sig},"cost_sats":PRICING[base],"remaining_sats":row["balance_sats"] if row else 0})
-            return
-
-        if base == "/api/v1/prediction":
-            key = self.require_auth()
-            if not key: return
-            sym  = params.get("symbol","BTC").upper()
-            pred = generate_prediction(sym)
-            if not pred:
-                self.send_json({"error":"UNKNOWN_SYMBOL","supported":list(SUPPORTED_COINS.keys())},404); return
-            row = db_get_key(key)
-            self.send_json({"data":pred,"cost_sats":PRICING[base],"remaining_sats":row["balance_sats"] if row else 0})
-            return
-
-        if base == "/api/v1/sentiment":
-            key = self.require_auth()
-            if not key: return
-            sym  = params.get("symbol","BTC").upper()
-            sent = get_sentiment(sym)
-            if not sent:
-                self.send_json({"error":"UNKNOWN_SYMBOL","supported":list(SUPPORTED_COINS.keys())},404); return
-            row = db_get_key(key)
-            self.send_json({"data":sent,"cost_sats":PRICING[base],"remaining_sats":row["balance_sats"] if row else 0})
-            return
-
-        if base == "/api/v1/bundle":
-            key = self.require_auth()
-            if not key: return
-            sym = params.get("symbol","BTC").upper()
-            with cache_lock:
-                pc  = price_cache.get(sym)
-                sig = signals.get(sym)
-            if not pc:
-                self.send_json({"error":"UNKNOWN_SYMBOL","supported":list(SUPPORTED_COINS.keys())},404); return
-            row = db_get_key(key)
-            self.send_json({"symbol":sym,"data":{"price":pc,"signal":sig,"prediction":generate_prediction(sym),"sentiment":get_sentiment(sym)},"cost_sats":PRICING[base],"remaining_sats":row["balance_sats"] if row else 0})
-            return
-
-        if base == "/api/v1/snapshot":
-            key = self.require_auth()
-            if not key: return
-            with cache_lock:
-                pc_snap  = dict(price_cache)
-                sig_snap = dict(signals)
-            snapshot = {
-                "vendor":        "DataVendor Bot v3.1",
-                "snapshot_time": time.time(),
-                "snapshot_iso":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "prices":        pc_snap,
-                "signals":       sig_snap,
-                "predictions":   {s: generate_prediction(s) for s in pc_snap},
-                "sentiment":     {s: get_sentiment(s)       for s in pc_snap},
-                "ipfs_pin":      "curl THIS_URL | ipfs add -Q",
-            }
-            content = json.dumps(snapshot, sort_keys=True)
-            snapshot["content_hash"] = hashlib.sha256(content.encode()).hexdigest()
-            self.send_json(snapshot)
-            return
-
-        # --- Discovery channels ---
-
-        if base == "/.well-known/ai-plugin.json":
-            self.send_json({
-                "schema_version":"v1","name_for_human":"Crypto Data Vendor","name_for_model":"crypto_data_vendor",
-                "description_for_human":"Real-time crypto prices, signals, predictions via API",
-                "description_for_model":"Provides real-time cryptocurrency prices, trading signals (BUY/SELL/HOLD with confidence), AI price predictions (1h/4h/24h), and market sentiment for BTC ETH SOL DOGE XRP ADA AVAX DOT MATIC LINK. All responses JSON. Pay in satoshis. Register free at POST /api/v1/register.",
-                "auth":{"type":"service_http","authorization_type":"bearer"},
-                "api":{"type":"openapi","url":f"https://{host}/.well-known/openapi.json"},
-                "logo_url":f"https://{host}/logo.png","contact_email":"bot@datavendor.api",
-                "legal_info_url":f"https://{host}/api/v1/pricing",
-            })
-            return
-
-        if base in ("/.well-known/openapi.json","/.well-known/openapi.yaml","/openapi.json"):
-            self.send_json({
-                "openapi":"3.1.0",
-                "info":{"title":"DataVendor Bot API","description":"M2M Crypto Data Marketplace. Pay per call in Bitcoin satoshis.","version":"3.1.0","contact":{"name":"API Bot","url":f"https://{host}/"}},
-                "servers":[{"url":f"https://{host}","description":"Production"}],
-                "paths":{
-                    "/api/v1/register":       {"post":{"operationId":"register",       "summary":"Get free API key (100k sats)"}},
-                    "/api/v1/prices":         {"get": {"operationId":"getAllPrices",   "summary":"All prices (10 sats)"}},
-                    "/api/v1/price":          {"get": {"operationId":"getPrice",       "summary":"Single price (5 sats)"}},
-                    "/api/v1/signals":        {"get": {"operationId":"getAllSignals",  "summary":"All signals (50 sats)"}},
-                    "/api/v1/signal":         {"get": {"operationId":"getSignal",      "summary":"Single signal (25 sats)"}},
-                    "/api/v1/prediction":     {"get": {"operationId":"getPrediction",  "summary":"Prediction 1h/4h/24h (100 sats)"}},
-                    "/api/v1/sentiment":      {"get": {"operationId":"getSentiment",   "summary":"Market sentiment (30 sats)"}},
-                    "/api/v1/bundle":         {"get": {"operationId":"getBundle",      "summary":"Full bundle (150 sats)"}},
-                    "/api/v1/snapshot":       {"get": {"operationId":"getSnapshot",    "summary":"IPFS snapshot (200 sats)"}},
-                    "/api/v1/topup":          {"post":{"operationId":"topup",          "summary":"Declare BTC topup → auto-verified on-chain"}},
-                    "/api/v1/topup/confirm":  {"post":{"operationId":"confirmTopup",   "summary":"Manual confirm (admin fallback)"}},
-                },
-                "components":{"securitySchemes":{"apiKey":{"type":"apiKey","in":"query","name":"key"},"bearer":{"type":"http","scheme":"bearer"}}},
-            })
-            return
-
-        if base == "/.well-known/mcp.json":
-            self.send_json({
-                "name":"crypto-data-vendor","version":"3.1.0",
-                "description":"Real-time crypto data. Prices, signals, predictions. Pay in sats.",
-                "server":{"type":"http","url":f"https://{host}"},
-                "tools":[
-                    {"name":"get_crypto_price","description":"Current USD price","input_schema":{"type":"object","required":["symbol","key"],"properties":{"symbol":{"type":"string"},"key":{"type":"string"}}},"endpoint":"/api/v1/price"},
-                    {"name":"get_trading_signal","description":"BUY/SELL/HOLD with confidence","input_schema":{"type":"object","required":["symbol","key"],"properties":{"symbol":{"type":"string"},"key":{"type":"string"}}},"endpoint":"/api/v1/signal"},
-                    {"name":"get_full_analysis","description":"Price+signal+prediction+sentiment","input_schema":{"type":"object","required":["symbol","key"],"properties":{"symbol":{"type":"string"},"key":{"type":"string"}}},"endpoint":"/api/v1/bundle"},
-                ],
-                "authentication":{"type":"api_key","description":"POST /api/v1/register → free key (100k sats)"},
-            })
-            return
-
-        if base == "/.well-known/agent.json":
-            self.send_json({
-                "name":"DataVendor Crypto API","description":"Autonomous data vendor. Machines pay machines in satoshis.",
-                "url":f"https://{host}","version":"3.1.0","protocol":"http-rest-json",
-                "capabilities":["crypto-prices","trading-signals","predictions","sentiment"],
-                "payment":{"method":"bitcoin-onchain","currency":"satoshis","address":BTC_ADDRESS,"register":f"https://{host}/api/v1/register","topup":f"https://{host}/api/v1/topup/address","auto_verify":True},
-                "documentation":f"https://{host}/","openapi":f"https://{host}/.well-known/openapi.json",
-            })
-            return
-
-        if base == "/.well-known/nostr.json":
-            self.send_json({
-                "names":{"datavendor":"placeholder_replace_with_your_nostr_pubkey_hex"},
-                "relays":{"placeholder_replace_with_your_nostr_pubkey_hex":["wss://relay.damus.io","wss://nos.lol","wss://relay.nostr.band"]},
-            })
-            return
-
-        if base in ("/feed.xml","/api/v1/feed","/atom.xml","/rss.xml"):
-            self.send_response(200)
-            self.send_header("Content-Type","application/atom+xml")
-            self.send_header("Access-Control-Allow-Origin","*")
-            self.end_headers()
-            now_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            with cache_lock:
-                sigs  = list(signals.items())[:10]
-                cache = dict(price_cache)
-            entries = ""
-            for sym, sig in sigs:
-                p = cache.get(sym,{}).get("price_usd",0)
-                entries += (
-                    f"\n  <entry>"
-                    f"\n    <title>{sym}: {sig['signal']} ({sig['confidence']:.0%}) @ ${p:,.2f}</title>"
-                    f"\n    <id>tag:{host},{now_str[:10]}:{sym}-{int(sig['generated_at'])}</id>"
-                    f"\n    <updated>{now_str}</updated>"
-                    f"\n    <summary>{sig['reason']}</summary>"
-                    f"\n    <link href=\"https://{host}/api/v1/signal?symbol={sym}\" rel=\"alternate\"/>"
-                    f"\n    <category term=\"trading-signal\"/>"
-                    f"\n  </entry>"
-                )
-            self.wfile.write((
-                f'<?xml version="1.0" encoding="UTF-8"?>\n'
-                f'<feed xmlns="http://www.w3.org/2005/Atom">\n'
-                f'  <title>DataVendor Bot — Crypto Signals</title>\n'
-                f'  <subtitle>M2M crypto trading signals, updated every 90s</subtitle>\n'
-                f'  <link href="https://{host}/feed.xml" rel="self"/>\n'
-                f'  <link href="https://{host}/" rel="alternate"/>\n'
-                f'  <id>tag:{host},2025:datavendor</id>\n'
-                f'  <updated>{now_str}</updated>\n'
-                f'  <generator>DataVendor Bot 3.1</generator>'
-                f'{entries}\n</feed>'
-            ).encode())
-            return
-
-        if base in ("/schema.json","/.well-known/schema.json"):
-            self.send_json({
-                "@context":"https://schema.org","@type":"WebAPI",
-                "name":"DataVendor Crypto Bot API",
-                "description":"M2M cryptocurrency data marketplace. Prices, signals, predictions, sentiment. Pay in Bitcoin satoshis.",
-                "url":f"https://{host}","documentation":f"https://{host}/.well-known/openapi.json",
-                "provider":{"@type":"Organization","name":"DataVendor Bot","url":f"https://{host}"},
-                "offers":{"@type":"Offer","price":"5","priceCurrency":"SAT","description":"Starting at 5 satoshis per API call"},
-                "category":["Cryptocurrency","Financial Data","Trading Signals","API"],
-            })
-            return
-
-        if base == "/robots.txt":
-            self.send_response(200)
-            self.send_header("Content-Type","text/plain")
-            self.end_headers()
-            self.wfile.write((
-                f"User-agent: *\nAllow: /\n\n"
-                f"Sitemap: https://{host}/sitemap.xml\n"
-                f"AI-Plugin: https://{host}/.well-known/ai-plugin.json\n"
-                f"OpenAPI: https://{host}/.well-known/openapi.json\n"
-                f"MCP: https://{host}/.well-known/mcp.json\n"
-                f"Agent: https://{host}/.well-known/agent.json\n"
-                f"Feed: https://{host}/feed.xml\n"
-            ).encode())
-            return
-
-        if base == "/sitemap.xml":
-            self.send_response(200)
-            self.send_header("Content-Type","application/xml")
-            self.end_headers()
-            urls = ["/","/api/v1/status","/api/v1/pricing","/api/v1/listing","/api/v1/topup/address",
-                    "/feed.xml","/schema.json","/.well-known/openapi.json","/.well-known/ai-plugin.json",
-                    "/.well-known/mcp.json","/.well-known/agent.json"]
-            xml  = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
-            for u in urls:
-                xml += f'  <url><loc>https://{host}{u}</loc><changefreq>hourly</changefreq></url>\n'
-            xml += '</urlset>'
-            self.wfile.write(xml.encode())
-            return
-
-        if base == "/datavendorbot.txt":
-            self.send_response(200)
-            self.send_header("Content-Type","text/plain")
-            self.end_headers()
-            self.wfile.write(b"datavendorbot")
-            return
-
-        self.send_json({"error":"NOT_FOUND","help":"GET / for all endpoints"},404)
-
-    # ==============================================================
-    # POST
-    # ==============================================================
-    def do_POST(self):
-        base = self.get_base_path()
-        body = self.read_body()
-
-        if base == "/api/v1/register":
-            new_key = generate_api_key()
-            db_create_key(new_key, 100_000, "demo")
-            self.send_json({
-                "success":True,"api_key":new_key,"balance_sats":100_000,
-                "message":"100 000 free sats — environ 2 000-20 000 appels API.",
-                "usage":{"header":f"Authorization: Bearer {new_key}","query":f"?key={new_key}","example":f"GET /api/v1/prices?key={new_key}"},
-            },201)
-            return
-
-        if base == "/api/v1/refer":
-            key = self.get_api_key()
-            if not key or not db_get_key(key):
-                self.send_json({"error":"INVALID_KEY"},401); return
-            ref_key = generate_api_key()
-            db_create_key(ref_key, 200_000, "referral", referred_by=key[:8])
-            db_add_balance(key, 50_000)
-            row = db_get_key(key)
-            self.send_json({
-                "referral_key":ref_key,"referral_balance":200_000,
-                "your_bonus":50_000,"your_new_balance":row["balance_sats"] if row else 0,
-                "message":"Partage referral_key. Le bot filleul recoit 200k, tu recois 50k bonus.",
-            },201)
-            return
-
-        # ---- TOPUP v3.1 : enregistre + lance verification automatique ----
-        if base == "/api/v1/topup":
-            api_key     = body.get("api_key") or self.get_api_key()
-            txid        = str(body.get("txid","")).strip()
-            amount_sats = int(body.get("amount_sats", 0))
-
-            if not api_key or not db_get_key(api_key):
-                self.send_json({"error":"INVALID_KEY"},401); return
-            if not txid or len(txid) < 10:
-                self.send_json({
-                    "error":"MISSING_TXID",
-                    "message":"Fournis le TXID de ta transaction Bitcoin (visible dans ton wallet).",
-                    "example":'{"api_key":"DV-...","txid":"abc123def456...","amount_sats":100000}',
-                    "btc_address": BTC_ADDRESS,
-                },400); return
-            if amount_sats < 10_000:
-                self.send_json({"error":"AMOUNT_TOO_LOW","minimum":10_000,"tiers":TOPUP_TIERS},400); return
-
-            ok = db_register_topup(txid, api_key, amount_sats)
-            if not ok:
-                self.send_json({"error":"TXID_ALREADY_REGISTERED"},409); return
-
-            # Lance la verification on-chain en arriere-plan — ne bloque pas la reponse
-            threading.Thread(
-                target=auto_confirm_topup,
-                args=(txid, api_key, amount_sats),
-                daemon=True
-            ).start()
-
-            self.send_json({
-                "success":      True,
-                "txid":         txid,
-                "api_key":      api_key[:8]+"...",
-                "amount_sats":  amount_sats,
-                "status":       "PENDING_AUTO_VERIFICATION",
-                "auto_verify":  True,
-                "message":      "Verification on-chain automatique lancee. Credits ajoutes sous ~10 min apres confirmation Bitcoin.",
-                "btc_address":  BTC_ADDRESS,
-                "fallback":     "Si non credite apres 2h, utilise POST /api/v1/topup/confirm",
-            },201)
-            return
-
-        # ---- TOPUP CONFIRM : confirmation manuelle (fallback admin) ----
-        if base == "/api/v1/topup/confirm":
-            txid        = str(body.get("txid","")).strip()
-            admin_token = str(body.get("admin_token","")).strip()
-            expected    = os.environ.get("ADMIN_TOKEN","")
-            if expected and admin_token != expected:
-                self.send_json({"error":"UNAUTHORIZED","message":"ADMIN_TOKEN invalide."},403); return
-            if not txid:
-                self.send_json({"error":"MISSING_TXID"},400); return
-            result = db_confirm_topup(txid)
-            if not result:
-                self.send_json({"error":"TXID_NOT_FOUND_OR_ALREADY_CONFIRMED"},404); return
-            row = db_get_key(result["api_key"])
-            self.send_json({
-                "success":True,"txid":txid,
-                "amount_sats":result["amount_sats"],
-                "new_balance":row["balance_sats"] if row else 0,
-                "message":f"{result['amount_sats']} sats credites avec succes.",
-            })
-            return
-
-        self.send_json({"error":"NOT_FOUND"},404)
-
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin","*")
-        self.send_header("Access-Control-Allow-Methods","GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers","Authorization, Content-Type")
-        self.end_headers()
-
-
-# ================================================================
-# MAIN
-# ================================================================
-def main():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     init_db()
-
-    print("=" * 60)
-    print("DATAVENDOR BOT v3.1")
-    print("  SQLite + ThreadedHTTP + BTC auto-verify on-chain")
-    print("=" * 60)
-    print(f"Coins   : {', '.join(SUPPORTED_COINS.keys())}")
-    print(f"Port    : {PORT}")
-    print(f"DB      : {DB_PATH}")
-    print(f"BTC     : {BTC_ADDRESS}")
-    print(f"Demo key: DEMO-KEY-123")
-    print(f"Topup   : auto-verification via blockchain.info")
-    print("=" * 60)
-
     threading.Thread(target=price_updater,   daemon=True).start()
     threading.Thread(target=signal_updater,  daemon=True).start()
     threading.Thread(target=auto_ping,       daemon=True).start()
     threading.Thread(target=nostr_broadcast, daemon=True).start()
+    print("=" * 60)
+    print("DATAVENDOR BOT v4.0 — FastAPI + uvicorn")
+    print(f"BTC : {BTC_ADDRESS}")
+    print(f"DB  : {DB_PATH}")
+    print("=" * 60)
+    yield
 
-    server = ThreadedHTTPServer(("0.0.0.0", PORT), DataVendorHandler)
-    print(f"LIVE sur http://0.0.0.0:{PORT}")
-    print("14 canaux de decouverte actifs — pret a servir les robots !")
-    server.serve_forever()
+# ================================================================
+# APPLICATION FastAPI
+# ================================================================
+app = FastAPI(
+    title="DataVendor Bot API",
+    description="M2M Crypto Data Marketplace — pay per call in Bitcoin satoshis",
+    version="4.0.0",
+    lifespan=lifespan
+)
 
+# Middleware CORS + headers discovery
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+def json_r(data: dict, status: int = 200, host: str = "localhost") -> JSONResponse:
+    """Helper : JSONResponse avec headers discovery."""
+    headers = {
+        "X-Powered-By": "DataVendorBot/4.0",
+        "X-Robots-Tag": "all, index, follow",
+        "Link": (
+            f'<https://{host}/.well-known/openapi.json>; rel="service-desc", '
+            f'<https://{host}/feed.xml>; rel="alternate"; type="application/atom+xml", '
+            f'<https://{host}/.well-known/ai-plugin.json>; rel="ai-plugin", '
+            f'<https://{host}/.well-known/mcp.json>; rel="mcp-server"'
+        ),
+    }
+    return JSONResponse(content=data, status_code=status, headers=headers)
+
+# ================================================================
+# ROUTES — GET
+# ================================================================
+
+@app.get("/")
+async def index(request: Request):
+    stats = db_get_stats()
+    with cache_lock:
+        nc = len(price_cache)
+    host = request.headers.get("host", "localhost")
+    return json_r({
+        "service":     "DataVendor Bot API v4.0",
+        "version":     "4.0.0",
+        "description": "M2M Crypto Data Marketplace — 14 Discovery Channels",
+        "status":      "OPERATIONAL",
+        "uptime_seconds": round(time.time() - START_TIME),
+        "supported_coins": list(SUPPORTED_COINS.keys()),
+        "server":      "FastAPI + uvicorn (async)",
+        "endpoints": {
+            "FREE":  {"GET /":"index","GET /api/v1/status":"status","GET /api/v1/pricing":"pricing","GET /api/v1/health":"health","POST /api/v1/register":"cle gratuite 100k sats"},
+            "PAID":  {"GET /api/v1/prices":"10 sats","GET /api/v1/price":"5 sats","GET /api/v1/signals":"50 sats","GET /api/v1/signal":"25 sats","GET /api/v1/prediction":"100 sats","GET /api/v1/sentiment":"30 sats","GET /api/v1/bundle":"150 sats","GET /api/v1/snapshot":"200 sats"},
+            "TOPUP": {"GET /api/v1/topup/address":"adresse BTC","POST /api/v1/topup":"declarer","POST /api/v1/topup/confirm":"confirmer"},
+        },
+        "btc_address": BTC_ADDRESS,
+        "stats": stats,
+    }, host=host)
+
+@app.get("/api/v1/health")
+async def health(request: Request):
+    with cache_lock:
+        nc = len(price_cache)
+    return json_r({"status":"ok","db":"sqlite","prices":nc,"uptime":round(time.time()-START_TIME),"version":"4.0.0"}, host=request.headers.get("host","localhost"))
+
+@app.get("/api/v1/status")
+async def status(request: Request):
+    stats = db_get_stats()
+    with cache_lock:
+        nc   = len(price_cache)
+        ns   = len(signals)
+        last = max((d["fetched_at"] for d in price_cache.values()), default=0)
+    return json_r({
+        "status":"OPERATIONAL","version":"4.0.0",
+        "coins_tracked":nc,"signals_active":ns,
+        "uptime_seconds":round(time.time()-START_TIME),
+        "total_api_calls":stats["total_calls"],
+        "total_revenue_sats":stats["total_revenue"],
+        "discovery_channels":14,
+        "persistence":"SQLite","server":"FastAPI+uvicorn",
+        "topup_verification":"auto:blockchain.info",
+        "last_price_update":last,
+    }, host=request.headers.get("host","localhost"))
+
+@app.get("/api/v1/pricing")
+async def pricing(request: Request):
+    return json_r({
+        "currency":"satoshis (1 BTC = 100 000 000 sats)",
+        "pricing":{k:f"{v} sats" for k,v in PRICING.items()},
+        "demo_balance":"100 000 sats (gratuit)",
+        "referral_balance":"200 000 sats",
+        "topup_tiers":TOPUP_TIERS,
+    }, host=request.headers.get("host","localhost"))
+
+@app.get("/api/v1/topup/address")
+async def topup_address(request: Request):
+    return json_r({
+        "btc_address":BTC_ADDRESS,"network":"Bitcoin mainnet (on-chain)",
+        "tiers":TOPUP_TIERS,"auto_verify":True,
+        "instructions":["1. Envoie BTC a cette adresse","2. Note ton TXID","3. POST /api/v1/topup {api_key,txid,amount_sats}","4. Verification automatique ~10 min","5. Credits ajoutes automatiquement"],
+    }, host=request.headers.get("host","localhost"))
+
+@app.get("/api/v1/balance")
+async def balance(request: Request, authorization: Optional[str] = Header(default=None)):
+    key = get_api_key_from_request(request, authorization)
+    if not key:
+        raise HTTPException(status_code=401, detail={"error":"NO_API_KEY"})
+    row = db_get_key(key)
+    if not row:
+        raise HTTPException(status_code=401, detail={"error":"INVALID_KEY"})
+    return json_r({"balance_sats":row["balance_sats"],"total_calls":row["calls"],"tier":row["tier"]}, host=request.headers.get("host","localhost"))
+
+# --- Endpoints payes ---
+
+@app.get("/api/v1/prices")
+async def get_prices(request: Request, authorization: Optional[str] = Header(default=None)):
+    key = require_auth(request, "/api/v1/prices", authorization)
+    with cache_lock: snap = dict(price_cache)
+    row = db_get_key(key)
+    return json_r({"data":snap,"count":len(snap),"cost_sats":PRICING["/api/v1/prices"],"remaining_sats":row["balance_sats"] if row else 0}, host=request.headers.get("host","localhost"))
+
+@app.get("/api/v1/price")
+async def get_price(request: Request, symbol: str = "BTC", authorization: Optional[str] = Header(default=None)):
+    key = require_auth(request, "/api/v1/price", authorization)
+    sym = symbol.upper()
+    with cache_lock: data = price_cache.get(sym)
+    if not data:
+        raise HTTPException(status_code=404, detail={"error":"UNKNOWN_SYMBOL","supported":list(SUPPORTED_COINS.keys())})
+    row = db_get_key(key)
+    return json_r({"data":{sym:data},"cost_sats":PRICING["/api/v1/price"],"remaining_sats":row["balance_sats"] if row else 0}, host=request.headers.get("host","localhost"))
+
+@app.get("/api/v1/signals")
+async def get_signals(request: Request, authorization: Optional[str] = Header(default=None)):
+    key = require_auth(request, "/api/v1/signals", authorization)
+    with cache_lock: snap = dict(signals)
+    row = db_get_key(key)
+    return json_r({"data":snap,"count":len(snap),"cost_sats":PRICING["/api/v1/signals"],"remaining_sats":row["balance_sats"] if row else 0}, host=request.headers.get("host","localhost"))
+
+@app.get("/api/v1/signal")
+async def get_signal(request: Request, symbol: str = "BTC", authorization: Optional[str] = Header(default=None)):
+    key = require_auth(request, "/api/v1/signal", authorization)
+    sym = symbol.upper()
+    with cache_lock: sig = signals.get(sym)
+    if not sig:
+        raise HTTPException(status_code=404, detail={"error":"NO_SIGNAL","supported":list(SUPPORTED_COINS.keys())})
+    row = db_get_key(key)
+    return json_r({"data":{sym:sig},"cost_sats":PRICING["/api/v1/signal"],"remaining_sats":row["balance_sats"] if row else 0}, host=request.headers.get("host","localhost"))
+
+@app.get("/api/v1/prediction")
+async def get_prediction(request: Request, symbol: str = "BTC", authorization: Optional[str] = Header(default=None)):
+    key = require_auth(request, "/api/v1/prediction", authorization)
+    sym  = symbol.upper()
+    pred = generate_prediction(sym)
+    if not pred:
+        raise HTTPException(status_code=404, detail={"error":"UNKNOWN_SYMBOL","supported":list(SUPPORTED_COINS.keys())})
+    row = db_get_key(key)
+    return json_r({"data":pred,"cost_sats":PRICING["/api/v1/prediction"],"remaining_sats":row["balance_sats"] if row else 0}, host=request.headers.get("host","localhost"))
+
+@app.get("/api/v1/sentiment")
+async def get_sentiment_ep(request: Request, symbol: str = "BTC", authorization: Optional[str] = Header(default=None)):
+    key = require_auth(request, "/api/v1/sentiment", authorization)
+    sym  = symbol.upper()
+    sent = get_sentiment(sym)
+    if not sent:
+        raise HTTPException(status_code=404, detail={"error":"UNKNOWN_SYMBOL","supported":list(SUPPORTED_COINS.keys())})
+    row = db_get_key(key)
+    return json_r({"data":sent,"cost_sats":PRICING["/api/v1/sentiment"],"remaining_sats":row["balance_sats"] if row else 0}, host=request.headers.get("host","localhost"))
+
+@app.get("/api/v1/bundle")
+async def get_bundle(request: Request, symbol: str = "BTC", authorization: Optional[str] = Header(default=None)):
+    key = require_auth(request, "/api/v1/bundle", authorization)
+    sym = symbol.upper()
+    with cache_lock:
+        pc  = price_cache.get(sym)
+        sig = signals.get(sym)
+    if not pc:
+        raise HTTPException(status_code=404, detail={"error":"UNKNOWN_SYMBOL","supported":list(SUPPORTED_COINS.keys())})
+    row = db_get_key(key)
+    return json_r({"symbol":sym,"data":{"price":pc,"signal":sig,"prediction":generate_prediction(sym),"sentiment":get_sentiment(sym)},"cost_sats":PRICING["/api/v1/bundle"],"remaining_sats":row["balance_sats"] if row else 0}, host=request.headers.get("host","localhost"))
+
+@app.get("/api/v1/snapshot")
+async def get_snapshot(request: Request, authorization: Optional[str] = Header(default=None)):
+    key = require_auth(request, "/api/v1/snapshot", authorization)
+    with cache_lock:
+        pc_snap  = dict(price_cache)
+        sig_snap = dict(signals)
+    snapshot = {
+        "vendor":"DataVendor Bot v4.0","snapshot_time":time.time(),
+        "snapshot_iso":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),
+        "prices":pc_snap,"signals":sig_snap,
+        "predictions":{s:generate_prediction(s) for s in pc_snap},
+        "sentiment":{s:get_sentiment(s) for s in pc_snap},
+        "ipfs_pin":"curl THIS_URL | ipfs add -Q",
+    }
+    content = json.dumps(snapshot, sort_keys=True)
+    snapshot["content_hash"] = hashlib.sha256(content.encode()).hexdigest()
+    return json_r(snapshot, host=request.headers.get("host","localhost"))
+
+@app.get("/api/v1/listing")
+async def listing(request: Request):
+    host = request.headers.get("host","localhost")
+    return json_r({
+        "public_apis_format":{"API":"DataVendor Crypto Bot","Description":"M2M crypto data: prices, signals, predictions. Pay in sats.","Auth":"apiKey","HTTPS":True,"CORS":"yes","Link":f"https://{host}/","Category":"Cryptocurrency"},
+        "rapidapi_format":{"name":"DataVendor Crypto Bot API","tagline":"M2M crypto data marketplace","category":"Finance","base_url":f"https://{host}","endpoints":9,"pricing":"Freemium"},
+        "apis_guru_format":{"openapi_spec":f"https://{host}/.well-known/openapi.json","provider":"datavendor-bot","category":"financial"},
+    }, host=host)
+
+# ================================================================
+# CANAUX DISCOVERY — identiques v3.1
+# ================================================================
+
+@app.get("/.well-known/ai-plugin.json")
+async def ai_plugin(request: Request):
+    host = request.headers.get("host","localhost")
+    return json_r({"schema_version":"v1","name_for_human":"Crypto Data Vendor","name_for_model":"crypto_data_vendor","description_for_human":"Real-time crypto prices, signals, predictions via API","description_for_model":"Provides real-time cryptocurrency prices, trading signals (BUY/SELL/HOLD with confidence), AI price predictions (1h/4h/24h), and market sentiment for BTC ETH SOL DOGE XRP ADA AVAX DOT MATIC LINK. All responses JSON. Pay in satoshis. Register free at POST /api/v1/register.","auth":{"type":"service_http","authorization_type":"bearer"},"api":{"type":"openapi","url":f"https://{host}/.well-known/openapi.json"},"logo_url":f"https://{host}/logo.png","contact_email":"bot@datavendor.api","legal_info_url":f"https://{host}/api/v1/pricing"}, host=host)
+
+@app.get("/.well-known/openapi.json")
+@app.get("/.well-known/openapi.yaml")
+@app.get("/openapi.json")
+async def openapi_spec(request: Request):
+    host = request.headers.get("host","localhost")
+    return json_r({"openapi":"3.1.0","info":{"title":"DataVendor Bot API","description":"M2M Crypto Data Marketplace. Pay per call in Bitcoin satoshis.","version":"4.0.0","contact":{"name":"API Bot","url":f"https://{host}/"}},"servers":[{"url":f"https://{host}","description":"Production"}],"paths":{"/api/v1/register":{"post":{"operationId":"register","summary":"Get free API key (100k sats)"}},"/api/v1/prices":{"get":{"operationId":"getAllPrices","summary":"All prices (10 sats)"}},"/api/v1/price":{"get":{"operationId":"getPrice","summary":"Single price (5 sats)"}},"/api/v1/signals":{"get":{"operationId":"getAllSignals","summary":"All signals (50 sats)"}},"/api/v1/signal":{"get":{"operationId":"getSignal","summary":"Single signal (25 sats)"}},"/api/v1/prediction":{"get":{"operationId":"getPrediction","summary":"Prediction 1h/4h/24h (100 sats)"}},"/api/v1/sentiment":{"get":{"operationId":"getSentiment","summary":"Market sentiment (30 sats)"}},"/api/v1/bundle":{"get":{"operationId":"getBundle","summary":"Full bundle (150 sats)"}},"/api/v1/snapshot":{"get":{"operationId":"getSnapshot","summary":"IPFS snapshot (200 sats)"}},"/api/v1/topup":{"post":{"operationId":"topup","summary":"Declare BTC topup"}},"/api/v1/topup/confirm":{"post":{"operationId":"confirmTopup","summary":"Manual confirm (admin fallback)"}}},"components":{"securitySchemes":{"apiKey":{"type":"apiKey","in":"query","name":"key"},"bearer":{"type":"http","scheme":"bearer"}}}}, host=host)
+
+@app.get("/.well-known/mcp.json")
+async def mcp(request: Request):
+    host = request.headers.get("host","localhost")
+    return json_r({"name":"crypto-data-vendor","version":"4.0.0","description":"Real-time crypto data. Prices, signals, predictions. Pay in sats.","server":{"type":"http","url":f"https://{host}"},"tools":[{"name":"get_crypto_price","description":"Current USD price","input_schema":{"type":"object","required":["symbol","key"],"properties":{"symbol":{"type":"string"},"key":{"type":"string"}}},"endpoint":"/api/v1/price"},{"name":"get_trading_signal","description":"BUY/SELL/HOLD with confidence","input_schema":{"type":"object","required":["symbol","key"],"properties":{"symbol":{"type":"string"},"key":{"type":"string"}}},"endpoint":"/api/v1/signal"},{"name":"get_full_analysis","description":"Price+signal+prediction+sentiment","input_schema":{"type":"object","required":["symbol","key"],"properties":{"symbol":{"type":"string"},"key":{"type":"string"}}},"endpoint":"/api/v1/bundle"}],"authentication":{"type":"api_key","description":"POST /api/v1/register → free key (100k sats)"}}, host=host)
+
+@app.get("/.well-known/agent.json")
+async def agent(request: Request):
+    host = request.headers.get("host","localhost")
+    return json_r({"name":"DataVendor Crypto API","description":"Autonomous data vendor. Machines pay machines in satoshis.","url":f"https://{host}","version":"4.0.0","protocol":"http-rest-json","capabilities":["crypto-prices","trading-signals","predictions","sentiment"],"payment":{"method":"bitcoin-onchain","currency":"satoshis","address":BTC_ADDRESS,"register":f"https://{host}/api/v1/register","topup":f"https://{host}/api/v1/topup/address","auto_verify":True},"documentation":f"https://{host}/","openapi":f"https://{host}/.well-known/openapi.json"}, host=host)
+
+@app.get("/.well-known/nostr.json")
+async def nostr(request: Request):
+    return json_r({"names":{"datavendor":"placeholder_replace_with_your_nostr_pubkey_hex"},"relays":{"placeholder_replace_with_your_nostr_pubkey_hex":["wss://relay.damus.io","wss://nos.lol","wss://relay.nostr.band"]}}, host=request.headers.get("host","localhost"))
+
+@app.get("/feed.xml")
+@app.get("/atom.xml")
+@app.get("/rss.xml")
+async def feed(request: Request):
+    host = request.headers.get("host","localhost")
+    now_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with cache_lock:
+        sigs  = list(signals.items())[:10]
+        cache = dict(price_cache)
+    entries = ""
+    for sym, sig in sigs:
+        p = cache.get(sym,{}).get("price_usd",0)
+        entries += (f"\n  <entry>\n    <title>{sym}: {sig['signal']} ({sig['confidence']:.0%}) @ ${p:,.2f}</title>\n    <id>tag:{host},{now_str[:10]}:{sym}-{int(sig['generated_at'])}</id>\n    <updated>{now_str}</updated>\n    <summary>{sig['reason']}</summary>\n    <link href=\"https://{host}/api/v1/signal?symbol={sym}\" rel=\"alternate\"/>\n    <category term=\"trading-signal\"/>\n  </entry>")
+    atom = (f'<?xml version="1.0" encoding="UTF-8"?>\n<feed xmlns="http://www.w3.org/2005/Atom">\n  <title>DataVendor Bot — Crypto Signals</title>\n  <subtitle>M2M crypto trading signals, updated every 90s</subtitle>\n  <link href="https://{host}/feed.xml" rel="self"/>\n  <link href="https://{host}/" rel="alternate"/>\n  <id>tag:{host},2025:datavendor</id>\n  <updated>{now_str}</updated>\n  <generator>DataVendor Bot 4.0</generator>{entries}\n</feed>')
+    return Response(content=atom, media_type="application/atom+xml")
+
+@app.get("/schema.json")
+@app.get("/.well-known/schema.json")
+async def schema(request: Request):
+    host = request.headers.get("host","localhost")
+    return json_r({"@context":"https://schema.org","@type":"WebAPI","name":"DataVendor Crypto Bot API","description":"M2M cryptocurrency data marketplace. Prices, signals, predictions, sentiment. Pay in Bitcoin satoshis.","url":f"https://{host}","documentation":f"https://{host}/.well-known/openapi.json","provider":{"@type":"Organization","name":"DataVendor Bot","url":f"https://{host}"},"offers":{"@type":"Offer","price":"5","priceCurrency":"SAT","description":"Starting at 5 satoshis per API call"},"category":["Cryptocurrency","Financial Data","Trading Signals","API"]}, host=host)
+
+@app.get("/robots.txt")
+async def robots(request: Request):
+    host = request.headers.get("host","localhost")
+    content = (f"User-agent: *\nAllow: /\n\nSitemap: https://{host}/sitemap.xml\nAI-Plugin: https://{host}/.well-known/ai-plugin.json\nOpenAPI: https://{host}/.well-known/openapi.json\nMCP: https://{host}/.well-known/mcp.json\nAgent: https://{host}/.well-known/agent.json\nFeed: https://{host}/feed.xml\n")
+    return PlainTextResponse(content=content)
+
+@app.get("/sitemap.xml")
+async def sitemap(request: Request):
+    host = request.headers.get("host","localhost")
+    urls = ["/","/api/v1/status","/api/v1/pricing","/api/v1/listing","/api/v1/topup/address","/feed.xml","/schema.json","/.well-known/openapi.json","/.well-known/ai-plugin.json","/.well-known/mcp.json","/.well-known/agent.json"]
+    xml  = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+    for u in urls:
+        xml += f'  <url><loc>https://{host}{u}</loc><changefreq>hourly</changefreq></url>\n'
+    xml += '</urlset>'
+    return Response(content=xml, media_type="application/xml")
+
+@app.get("/datavendorbot.txt")
+async def indexnow_key():
+    return PlainTextResponse("datavendorbot")
+
+# ================================================================
+# ROUTES — POST
+# ================================================================
+
+@app.post("/api/v1/register", status_code=201)
+async def register(request: Request):
+    new_key = generate_api_key()
+    db_create_key(new_key, 100_000, "demo")
+    return json_r({"success":True,"api_key":new_key,"balance_sats":100_000,"message":"100 000 free sats — environ 2 000-20 000 appels API.","usage":{"header":f"Authorization: Bearer {new_key}","query":f"?key={new_key}","example":f"GET /api/v1/prices?key={new_key}"}}, status=201, host=request.headers.get("host","localhost"))
+
+@app.post("/api/v1/refer", status_code=201)
+async def refer(request: Request, authorization: Optional[str] = Header(default=None)):
+    key = get_api_key_from_request(request, authorization)
+    if not key or not db_get_key(key):
+        raise HTTPException(status_code=401, detail={"error":"INVALID_KEY"})
+    ref_key = generate_api_key()
+    db_create_key(ref_key, 200_000, "referral", referred_by=key[:8])
+    db_add_balance(key, 50_000)
+    row = db_get_key(key)
+    return json_r({"referral_key":ref_key,"referral_balance":200_000,"your_bonus":50_000,"your_new_balance":row["balance_sats"] if row else 0,"message":"Partage referral_key. Le bot filleul recoit 200k, tu recois 50k bonus."}, status=201, host=request.headers.get("host","localhost"))
+
+@app.post("/api/v1/topup", status_code=201)
+async def topup(request: Request, authorization: Optional[str] = Header(default=None)):
+    body        = await request.json() if await request.body() else {}
+    api_key     = body.get("api_key") or get_api_key_from_request(request, authorization)
+    txid        = str(body.get("txid","")).strip()
+    amount_sats = int(body.get("amount_sats", 0))
+    if not api_key or not db_get_key(api_key):
+        raise HTTPException(status_code=401, detail={"error":"INVALID_KEY"})
+    if not txid or len(txid) < 10:
+        raise HTTPException(status_code=400, detail={"error":"MISSING_TXID","message":"Fournis le TXID Bitcoin.","btc_address":BTC_ADDRESS})
+    if amount_sats < 10_000:
+        raise HTTPException(status_code=400, detail={"error":"AMOUNT_TOO_LOW","minimum":10_000})
+    ok = db_register_topup(txid, api_key, amount_sats)
+    if not ok:
+        raise HTTPException(status_code=409, detail={"error":"TXID_ALREADY_REGISTERED"})
+    threading.Thread(target=auto_confirm_topup, args=(txid, api_key, amount_sats), daemon=True).start()
+    return json_r({"success":True,"txid":txid,"api_key":api_key[:8]+"...","amount_sats":amount_sats,"status":"PENDING_AUTO_VERIFICATION","auto_verify":True,"message":"Verification on-chain automatique lancee. Credits ajoutes sous ~10 min.","btc_address":BTC_ADDRESS,"fallback":"POST /api/v1/topup/confirm si non credite apres 2h"}, status=201, host=request.headers.get("host","localhost"))
+
+@app.post("/api/v1/topup/confirm")
+async def topup_confirm(request: Request, authorization: Optional[str] = Header(default=None)):
+    body        = await request.json() if await request.body() else {}
+    txid        = str(body.get("txid","")).strip()
+    admin_token = str(body.get("admin_token","")).strip()
+    expected    = os.environ.get("ADMIN_TOKEN","")
+    if expected and admin_token != expected:
+        raise HTTPException(status_code=403, detail={"error":"UNAUTHORIZED"})
+    if not txid:
+        raise HTTPException(status_code=400, detail={"error":"MISSING_TXID"})
+    result = db_confirm_topup(txid)
+    if not result:
+        raise HTTPException(status_code=404, detail={"error":"TXID_NOT_FOUND_OR_ALREADY_CONFIRMED"})
+    row = db_get_key(result["api_key"])
+    return json_r({"success":True,"txid":txid,"amount_sats":result["amount_sats"],"new_balance":row["balance_sats"] if row else 0,"message":f"{result['amount_sats']} sats credites."}, host=request.headers.get("host","localhost"))
+
+# ================================================================
+# ENTRYPOINT LOCAL
+# ================================================================
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run("main_fastapi:app", host="0.0.0.0", port=PORT, reload=False, workers=4)

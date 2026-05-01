@@ -13,7 +13,7 @@
 #   uvicorn main_fastapi:app --host 0.0.0.0 --port 10000
 #
 # DEPLOY RAILWAY :
-#   Procfile : web: uvicorn main_fastapi:app --host 0.0.0.0 --port $PORT --workers 4
+#   Procfile : web: uvicorn main_fastapi:app --host 0.0.0.0 --port $PORT --workers 4 --loop asyncio
 #   Volume   : Mount Path = /data
 #   Variables: BTC_ADDRESS, HOST_URL, ADMIN_TOKEN (optionnels)
 #
@@ -827,4 +827,4 @@ async def topup_confirm(request: Request, authorization: Optional[str] = Header(
 # ================================================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main_fastapi:app", host="0.0.0.0", port=PORT, reload=False, workers=4)
+    uvicorn.run("main_fastapi:app", host="0.0.0.0", port=PORT, reload=False, workers=4, loop=asyncio)

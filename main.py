@@ -13,7 +13,7 @@
 #   uvicorn main_fastapi:app --host 0.0.0.0 --port 10000
 #
 # DEPLOY RAILWAY :
-#   Procfile : web: uvicorn main_fastapi:app --host 0.0.0.0 --port $PORT --workers 4 --loop asyncio
+#   Procfile : web: uvicorn main_fastapi:app --host 0.0.0.0 --port $PORT --workers 4
 #   Volume   : Mount Path = /data
 #   Variables: BTC_ADDRESS, HOST_URL, ADMIN_TOKEN (optionnels)
 #
@@ -49,7 +49,7 @@ from typing import Optional
 # ================================================================
 BTC_ADDRESS = os.environ.get("BTC_ADDRESS", "1QAWwqdrBE7cL3ZBkNgJvmV95nhe3yoHeu")
 DB_PATH     = os.environ.get("DB_PATH",     "/data/datavendor.db")
-HOST_URL    = os.environ.get("HOST_URL",    https://web-production-e5d14.up.railway.app)
+HOST_URL    = os.environ.get("HOST_URL",    "https://web-production-a2ec.up.railway.app")
 PORT        = int(os.environ.get("PORT",    10000))
 START_TIME  = time.time()
 
@@ -827,4 +827,4 @@ async def topup_confirm(request: Request, authorization: Optional[str] = Header(
 # ================================================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main_fastapi:app", host="0.0.0.0", port=PORT, reload=False, workers=4, loop=asyncio)
+    uvicorn.run("main_fastapi:app", host="0.0.0.0", port=PORT, reload=False, workers=4)
